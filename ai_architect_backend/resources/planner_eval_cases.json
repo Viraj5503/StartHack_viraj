@@ -1,0 +1,62 @@
+[
+  {
+    "question": "Show me all tests we have done for customer Megaplant.",
+    "expected_intent": "data_selection"
+  },
+  {
+    "question": "List all charpy impact tests performed by tester MasterOfDesaster.",
+    "expected_intent": "data_selection"
+  },
+  {
+    "question": "Compare material FancyPlast 42 and UltraPlast 99 regarding tensile strength. Are differences statistically significant?",
+    "expected_intent": "comparison"
+  },
+  {
+    "question": "Do my Z05 and Z20 machines produce significantly different results?",
+    "expected_intent": "comparison"
+  },
+  {
+    "question": "Do my Ulm and Kennesaw sites deliver comparable quality?",
+    "expected_intent": "comparison"
+  },
+  {
+    "question": "Is there a trend that tensile strength is decreasing over the last 6 months?",
+    "expected_intent": "trend_drift"
+  },
+  {
+    "question": "Is there an indication that boundary 10 MPa tensile modulus will be violated in the future?",
+    "expected_intent": "trend_drift"
+  },
+  {
+    "question": "Check anomalies for Machine A versus Machine B over the last 7 days.",
+    "expected_intent": "comparison"
+  },
+  {
+    "question": "Find outliers in maximum force results for this material.",
+    "expected_intent": "anomaly_check"
+  },
+  {
+    "question": "Is this measured value plausible as per ISO 1234?",
+    "expected_intent": "validation_compliance"
+  },
+  {
+    "question": "Is the measured tensile strength within our internal limits?",
+    "expected_intent": "validation_compliance"
+  },
+  {
+    "question": "If I change parameter A, how does that influence property B?",
+    "expected_intent": "hypothesis"
+  },
+  {
+    "question": "Show only Tuesday tests for Machine C.",
+    "expected_intent": "data_selection"
+  },
+  {
+    "question": "Summarize all available material properties for Fancyplast 42.",
+    "expected_intent": "summary"
+  },
+  {
+    "question": "Check compliance and anomaly risk for this week's tensile tests.",
+    "expected_intent": "validation_compliance"
+  }
+]

@@ -1,0 +1,9 @@
+.DS_Store
+.venv/
+
+# Python caches
+**/__pycache__/
+*.pyc
+
+# Local secrets
+ai_architect_backend/.env
