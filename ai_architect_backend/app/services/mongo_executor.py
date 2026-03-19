@@ -1,4 +1,7 @@
 from datetime import datetime, timedelta
+import json
+from functools import lru_cache
+from pathlib import Path
 import re
 from typing import Any, Callable
 
@@ -54,6 +57,51 @@ TESTS_SCOPE_FILTER_TOKENS = {
     "testprogramid",
     "testparametersflat",
 }
+ATTRIBUTE_ALIASES = {
+    "wallthickness": "Wall thickness",
+    "specimenthickness": "SPECIMEN_THICKNESS",
+    "specimenwidth": "SPECIMEN_WIDTH",
+    "diameter": "Diameter",
+    "outerdiameter": "Outer diameter",
+    "innerdiameter": "Inner diameter",
+    "weight": "Weight of the specimen",
+    "weightofthespecimen": "Weight of the specimen",
+    "crosssection": "Cross-section input",
+    "crosssectioninput": "Cross-section input",
+    "density": "Density of the specimen material",
+    "youngsmodulus": "Young's modulus preset",
+    "testspeed": "TEST_SPEED",
+}
+
+
+def _normalize_attribute_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+@lru_cache
+def _load_test_parameter_name_index() -> dict[str, str]:
+    index: dict[str, str] = {}
+    # Local copied helpers in this repo are the primary source.
+    path = Path(__file__).resolve().parents[2] / "resources" / "uuid_helpers" / "TestParameterMap.json"
+    if not path.exists():
+        return index
+
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return index
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("en")
+        if not isinstance(name, str):
+            continue
+        token = _normalize_attribute_token(name)
+        if token and token not in index:
+            index[token] = name
+
+    return index
 
 
 def _normalize_filter_scope_token(field: str) -> str:
@@ -108,7 +156,7 @@ def _filters_to_match(
     field_resolver: Callable[[str], str] | None = None,
     field_prefix: str = "",
 ) -> dict[str, Any]:
-    query: dict[str, Any] = {}
+    and_clauses: list[dict[str, Any]] = []
 
     site_hint_present = any(
         isinstance(item.get("field"), str)
@@ -278,12 +326,18 @@ def _filters_to_match(
 
         clause = build_clause(with_prefix(resolved_field), operator, value)
         if clause:
-            query.update(clause)
+            and_clauses.append(clause)
 
+    if and_clauses and or_clauses:
+        return {"$and": [*and_clauses, {"$or": or_clauses}]}
+    if len(and_clauses) == 1:
+        return and_clauses[0]
+    if len(and_clauses) > 1:
+        return {"$and": and_clauses}
     if or_clauses:
-        query["$or"] = or_clauses
+        return {"$or": or_clauses}
 
-    return query
+    return {}
 
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$")
@@ -410,6 +464,25 @@ def _contains_deprecated_placeholder(value: Any) -> bool:
 
     if isinstance(value, str):
         return _is_deprecated_field_reference(value)
+
+    return False
+
+
+def _contains_tests_scope_reference(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str) and (key == "test" or key.startswith("test.")):
+                return True
+            if _contains_tests_scope_reference(nested):
+                return True
+        return False
+
+    if isinstance(value, list):
+        return any(_contains_tests_scope_reference(item) for item in value)
+
+    if isinstance(value, str):
+        token = value.strip()
+        return token == "$test" or token.startswith("$test.")
 
     return False
 
@@ -569,6 +642,171 @@ class MongoExecutor:
         }
         return aliases.get(token)
 
+    def _extract_metric_request(self, question: str) -> dict[str, str] | None:
+        q = question.strip().lower()
+        if not q:
+            return None
+
+        metric_op: str | None = None
+        metric_prefix: str | None = None
+        if any(token in q for token in {"highest", "maximum", " max "}):
+            metric_op = "$max"
+            metric_prefix = "highest"
+        elif any(token in q for token in {"lowest", "minimum", " min "}):
+            metric_op = "$min"
+            metric_prefix = "lowest"
+        elif any(token in q for token in {"average", "mean", " avg "}):
+            metric_op = "$avg"
+            metric_prefix = "average"
+
+        if not metric_op or not metric_prefix:
+            return None
+
+        # Try to capture the phrase after highest/lowest/average up to a connector.
+        metric_phrase_match = re.search(
+            r"(?:highest|maximum|max(?:imum)?|lowest|minimum|min(?:imum)?|average|mean|avg)\s+(.+?)(?=\s+(?:for|of|between|among|across|and|by|where|in|on|with|for\b\s+tester)\b|[\,\?\.!]|$)",
+            q,
+            flags=re.I,
+        )
+        metric_phrase = metric_phrase_match.group(1).strip() if metric_phrase_match else ""
+        metric_phrase = re.sub(r"\btester[_\-]?\d+\b", "", metric_phrase, flags=re.I).strip()
+        metric_phrase = re.sub(r"\s+", " ", metric_phrase)
+
+        normalized_metric = _normalize_attribute_token(metric_phrase)
+        attribute_key = ATTRIBUTE_ALIASES.get(normalized_metric)
+
+        parameter_index = _load_test_parameter_name_index()
+        if not attribute_key and normalized_metric in parameter_index:
+            attribute_key = parameter_index[normalized_metric]
+
+        if not attribute_key and normalized_metric:
+            # Fuzzy fallback: nearest key by token containment and length distance.
+            fuzzy_candidates: list[tuple[int, str]] = []
+            for token, name in parameter_index.items():
+                if normalized_metric in token or token in normalized_metric:
+                    fuzzy_candidates.append((abs(len(token) - len(normalized_metric)), name))
+            if fuzzy_candidates:
+                fuzzy_candidates.sort(key=lambda item: item[0])
+                attribute_key = fuzzy_candidates[0][1]
+
+        if not attribute_key:
+            return None
+
+        metric_suffix = re.sub(r"[^a-z0-9]+", "_", attribute_key.lower()).strip("_")
+        metric_field_name = f"{metric_prefix}_{metric_suffix}"
+        return {
+            "attribute_key": attribute_key,
+            "metric_op": metric_op,
+            "metric_field_name": metric_field_name,
+        }
+
+    def _semantic_result_uuids(self, semantic_candidates: list[dict] | None, max_items: int = 6) -> list[str]:
+        if not semantic_candidates:
+            return []
+
+        uuids: list[str] = []
+        seen: set[str] = set()
+        for item in semantic_candidates:
+            if not isinstance(item, dict):
+                continue
+
+            category = str(item.get("category", "")).strip().lower()
+            if category not in {"result", "channel"}:
+                continue
+
+            raw_uuid = item.get("uuid")
+            if not isinstance(raw_uuid, str) or not raw_uuid.strip():
+                continue
+
+            normalized = raw_uuid.strip().strip("{}")
+            if not normalized:
+                continue
+
+            unique_key = normalized.lower()
+            if unique_key in seen:
+                continue
+
+            seen.add(unique_key)
+            uuids.append(normalized)
+            if len(uuids) >= max_items:
+                break
+
+        return uuids
+
+    def _semantic_childid_match(self, semantic_candidates: list[dict] | None) -> dict[str, Any] | None:
+        uuids = self._semantic_result_uuids(semantic_candidates)
+        if not uuids:
+            return None
+
+        clauses = [{"metadata.childId": {"$regex": re.escape(uuid), "$options": "i"}} for uuid in uuids]
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$or": clauses}
+
+    def _resolve_tests_scope_ref_ids(self, plan: Any, db: Any, max_ids: int = 3000) -> list[str] | None:
+        raw_filters = [f.model_dump() for f in getattr(plan, "filters", [])]
+        tests_scope_filters = [
+            item
+            for item in raw_filters
+            if _is_tests_scope_filter(str(item.get("field", "")))
+        ]
+        if not tests_scope_filters:
+            return None
+
+        tests_match_query = _filters_to_match(
+            tests_scope_filters,
+            field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
+        )
+        if not tests_match_query:
+            return None
+
+        try:
+            tests_collection = db[self.settings.mongo_collection_tests]
+            cursor = tests_collection.find(tests_match_query, {"_id": 1}).limit(max_ids)
+            ref_ids: list[str] = []
+            seen: set[str] = set()
+            for row in cursor:
+                raw_id = row.get("_id")
+                if raw_id is None:
+                    continue
+                doc_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+                if not doc_id or doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                ref_ids.append(doc_id)
+            return ref_ids
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _inject_refid_fast_match(self, pipeline: list[dict[str, Any]], ref_ids: list[str] | None) -> list[dict[str, Any]]:
+        if ref_ids is None:
+            return pipeline
+
+        if not ref_ids:
+            # tests-scope filters exist but no matching tests were found.
+            return [{"$match": {"_id": {"$exists": False}}}]
+
+        cleaned: list[dict[str, Any]] = []
+        for stage in pipeline:
+            if "$lookup" in stage and isinstance(stage["$lookup"], dict):
+                lookup = stage["$lookup"]
+                if lookup.get("from") == self.settings.mongo_collection_tests and lookup.get("as") == "test":
+                    continue
+
+            if "$unwind" in stage:
+                unwind = stage["$unwind"]
+                if isinstance(unwind, str) and unwind in {"$test", "test"}:
+                    continue
+                if isinstance(unwind, dict) and str(unwind.get("path")) in {"$test", "test"}:
+                    continue
+
+            if "$match" in stage and _contains_tests_scope_reference(stage.get("$match")):
+                continue
+
+            cleaned.append(stage)
+
+        return [{"$match": {"metadata.refId": {"$in": ref_ids}}}, *cleaned]
+
     def _normalize_stage(self, stage: Any) -> dict[str, Any] | None:
         if not isinstance(stage, dict) or not stage:
             return None
@@ -603,73 +841,12 @@ class MongoExecutor:
             validated.append(normalized_stage)
         return validated
 
-    # Fields that are reliable for pre-query entity matching.
-    # Excludes testProgramId / program because the LLM often fabricates non-existent IDs.
-    _PREQUERY_ENTITY_FIELDS = {"customer", "material", "standard", "tester", "status", "state", "result"}
-
-    def _resolve_tests_scope_to_refids(self, plan: Any, db: Any, max_ids: int = 2000) -> list[str] | None:
-        """Pre-query the Tests collection to get IDs matching entity-level filters.
-
-        Uses only reliable entity fields (material, customer, tester, standard) to avoid
-        false zero results from LLM-fabricated testProgramId values.
-
-        Returns a list of test IDs (possibly empty) when entity filters exist,
-        or None if no entity filters are present.
-        """
-        raw_filters = [f.model_dump() for f in getattr(plan, "filters", [])]
-
-        def _is_entity_filter(field: str) -> bool:
-            token = _normalize_filter_scope_token(field)
-            return token in self._PREQUERY_ENTITY_FIELDS
-
-        entity_filters = [
-            item for item in raw_filters
-            if _is_entity_filter(str(item.get("field", "")))
-        ]
-        if not entity_filters:
-            return None  # No entity filters — pre-query not needed
-
-        match_query = _filters_to_match(
-            entity_filters,
-            field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
-        )
-        if not match_query:
+    def _generate_candidate_llm(self, plan: Any, semantic_candidates: list[dict] | None = None) -> MongoQueryCandidate | None:
+        provider = self.settings.llm_provider.lower()
+        if provider not in {"anthropic", "openai"} or not self.gateway.is_ready():
             return None
 
-        try:
-            tests_coll = db[self.settings.mongo_collection_tests]
-            cursor = tests_coll.find(match_query, {"_id": 1}).limit(max_ids)
-            return [str(doc["_id"]) for doc in cursor]
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _inject_refid_filter(
-        self,
-        pipeline: list[dict[str, Any]],
-        test_ids: list[str],
-    ) -> list[dict[str, Any]]:
-        """Prepend a metadata.refId filter to the pipeline for efficient Values-collection queries.
-
-        When test IDs are known up-front, filtering by refId at the start of the pipeline
-        is far more efficient than doing a full-collection $lookup.  Any existing $match on
-        metadata.refId is replaced; other stages (including $lookup) are preserved so they
-        don't break correctness.
-        """
-        if not test_ids:
-            # No matching tests → intentionally return zero rows.
-            return [{"$match": {"_id": {"$exists": False}}}]
-
-        refid_stage = {"$match": {"metadata.refId": {"$in": test_ids}}}
-        # Remove any pre-existing metadata.refId $match so we don't double-filter.
-        filtered = [
-            stage for stage in pipeline
-            if not ("$match" in stage and "metadata.refId" in stage.get("$match", {}))
-        ]
-        return [refid_stage] + filtered
-
-    def _generate_candidate_llm(self, plan: Any, semantic_candidates: list[dict] | None = None, pre_test_ids: list[str] | None = None) -> MongoQueryCandidate | None:
-        if self.settings.llm_provider.lower() != "anthropic" or not self.gateway.is_ready():
-            return None
+        model_name = self.settings.openai_model_query if provider == "openai" else self.settings.anthropic_model_query
 
         # Extract UUIDs from semantic candidates so the LLM can build correct childId regex filters.
         semantic_uuids: list[dict] = []
@@ -691,24 +868,6 @@ class MongoExecutor:
             "chart_needed": bool(getattr(plan, "chart_needed", False)),
         }
 
-        # Build the refId hint section when pre-fetched test IDs are available.
-        refid_hint = ""
-        if pre_test_ids is not None:
-            if pre_test_ids:
-                ids_sample = pre_test_ids[:50]
-                refid_hint = (
-                    f"\nPRE-FETCHED TEST IDs ({len(pre_test_ids)} matching tests, showing first {len(ids_sample)}): "
-                    f"{ids_sample}\n"
-                    "IMPORTANT: Use these test IDs to filter the Values collection efficiently:\n"
-                    "  Start the pipeline with: {\"$match\": {\"metadata.refId\": {\"$in\": [<paste IDs here>]}}}\n"
-                    "  Do NOT use $lookup when pre_test_ids are provided — use the $in filter above.\n"
-                )
-            else:
-                refid_hint = (
-                    "\nPRE-FETCHED TEST IDs: NONE FOUND. The tests-scope filters matched zero tests.\n"
-                    "Return a pipeline that will produce 0 results: [{\"$match\": {\"_id\": {\"$exists\": false}}}]\n"
-                )
-
         system_prompt = (
             "You are a MongoDB aggregation generator for materials testing data. "
             "Return strict JSON only."
@@ -721,32 +880,37 @@ class MongoExecutor:
             "Never use $out or $merge.\n"
             "CRITICAL Mongo schema facts (read carefully before generating):\n"
             "- Tests physical collection: _tests\n"
-            "  Fields: _id (string, format '{UUID}'), name, state, testProgramId, TestParametersFlat (nested object)\n"
-            "  Key TestParametersFlat sub-fields: CUSTOMER, MATERIAL, TESTER, STANDARD, MACHINE_TYPE_STR, CUSTOMER_NAME, NOTES\n"
+            "  Top-level fields: _id (string, format '{UUID}'), name, state, testProgramId, TestParametersFlat (nested object)\n"
             "  WARNING: modifiedOn in _tests is stored as {} (empty object) - NEVER filter or sort by modifiedOn\n"
+            "  CRITICAL: ALL test metadata lives inside TestParametersFlat - ALWAYS use the full dotted path:\n"
+            "    TestParametersFlat.TESTER       -> tester/operator name (e.g. 'Tester_2')\n"
+            "    TestParametersFlat.CUSTOMER     -> customer/company name (e.g. 'Company_1')\n"
+            "    TestParametersFlat.CUSTOMER_NAME-> alternative customer name field\n"
+            "    TestParametersFlat.MATERIAL     -> material under test\n"
+            "    TestParametersFlat.STANDARD     -> test standard (e.g. 'DIN EN ISO 6892-1')\n"
+            "    TestParametersFlat.TYPE_OF_TESTING_STR -> test type: 'tensile', 'compression', or 'flexure'\n"
+            "    TestParametersFlat.MACHINE_TYPE_STR -> machine type string\n"
+            "    TestParametersFlat.NOTES        -> free-text notes\n"
+            "    TestParametersFlat.SPECIMEN_TYPE-> specimen type identifier\n"
+            "    TestParametersFlat.JOB_NO       -> job/order number\n"
+            "  NEVER use bare field names like 'tester', 'customer', 'material', 'standard' without the TestParametersFlat. prefix.\n"
             "- Values physical collection: valuecolumns_migrated\n"
             "  Fields: _id (ObjectId), metadata.refId (string matching _tests._id), "
             "metadata.childId (composite string like '{UUID}-UnitTable.{UUID}-UnitTable_Value' or '{UUID}.{UUID}_Value'), "
             "uploadDate (ISODate - use this for ALL date/time filtering), values (float array), valuesCount (int)\n"
             "- Join relation: _tests._id == valuecolumns_migrated.metadata.refId\n"
             "- For date/time filtering: ALWAYS use uploadDate on valuecolumns_migrated, never modifiedOn\n"
-            "- For material/customer/tester filtering with the Values collection:\n"
-            "  If pre_test_ids are given (see below), use {\"$match\": {\"metadata.refId\": {\"$in\": [ids]}}}\n"
-            "  If NOT given, use $lookup: {\"from\": \"_tests\", \"localField\": \"metadata.refId\", \"foreignField\": \"_id\", \"as\": \"test\"}\n"
-            "  then $unwind \"$test\" and $match on test.TestParametersFlat.MATERIAL / .CUSTOMER / .TESTER with $regex case-insensitive\n"
-            "- For string field filters (material, customer, tester, standard) always use $regex with $options 'i' for case-insensitive matching\n"
             "- For childId UUID matching: use $regex, e.g. {\"$regex\": \"UUID_HERE\", \"$options\": \"i\"}\n"
             "  The semantic_candidates in the plan contain UUIDs - wrap them in regex for childId matching\n"
             "- If no specific childId UUID is known, do NOT add a childId filter - return all values\n"
             "- IMPORTANT: the values collection contains 5.9M documents. For trend/anomaly analysis, do NOT\n"
-            "  use a small $limit before the material/date filter. Filter first, then limit.\n"
+            "  use a small $limit before $unwind. Fetch at least 200 raw documents (before unwind).\n"
             "  Each document's 'values' array holds ~44000 floats. Use $limit AFTER $unwind to cap output.\n"
             "- DATA DATE RANGE: uploadDate values in the dataset range from 2026-02-27 to 2026-03-03.\n"
             "  For questions like 'last 6 months', use ISODate('2025-09-01') as the lower bound.\n"
             "  DO NOT emit date values as plain strings - emit them as ISO format that Python can parse.\n"
             "  All data falls within the last 6 months, so a broad date range will return results.\n"
             "Avoid deprecated placeholders: site, test_name, sample_id, test_date, test_id, createdAt.\n"
-            f"{refid_hint}"
             f"Plan: {compact_plan}\n"
             f"Semantic UUID candidates (use these for childId regex matching if relevant): {semantic_uuids}\n"
             f"Max rows limit: {self.settings.max_query_rows}\n"
@@ -769,7 +933,7 @@ class MongoExecutor:
         result = None
         for prompt in prompt_attempts:
             candidate_result = self.gateway.generate_json(
-                model=self.settings.anthropic_model_query,
+                model=model_name,
                 system_prompt=system_prompt,
                 user_prompt=prompt,
             )
@@ -795,6 +959,18 @@ class MongoExecutor:
         # Remove hallucinated field references (e.g. values.uuid) that never exist.
         pipeline = _sanitize_llm_pipeline(pipeline, collection_value)
 
+        # If the LLM omitted a $match stage entirely but the plan has filters, inject one.
+        # This prevents silent full-collection scans when the LLM ignores filter fields.
+        if not any("$match" in stage for stage in pipeline) and getattr(plan, "filters", []):
+            logical_collection = CollectionName(collection_value)
+            raw_filters = [f.model_dump() for f in plan.filters]
+            injected_match = _filters_to_match(
+                raw_filters,
+                field_resolver=lambda field: self._resolve_filter_field(field, logical_collection),
+            )
+            if injected_match:
+                pipeline.insert(0, {"$match": injected_match})
+
         if not any("$limit" in stage for stage in pipeline):
             pipeline.append({"$limit": min(200, self.settings.max_query_rows)})
 
@@ -817,9 +993,9 @@ class MongoExecutor:
             expected_shape=[str(item) for item in expected_shape],
         )
 
-    def generate_candidate_from_plan(self, plan: Any, allow_llm: bool = True, semantic_candidates: list[dict] | None = None, pre_test_ids: list[str] | None = None) -> MongoQueryCandidate:
+    def generate_candidate_from_plan(self, plan: Any, allow_llm: bool = True, semantic_candidates: list[dict] | None = None) -> MongoQueryCandidate:
         if allow_llm and self.settings.query_mode.lower() == "llm":
-            llm_candidate = self._generate_candidate_llm(plan, semantic_candidates=semantic_candidates, pre_test_ids=pre_test_ids)
+            llm_candidate = self._generate_candidate_llm(plan, semantic_candidates=semantic_candidates)
             if llm_candidate is not None:
                 return llm_candidate
 
@@ -843,44 +1019,50 @@ class MongoExecutor:
                 value_filters,
                 field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.values),
             )
-            if value_match_query:
-                pipeline.append({"$match": value_match_query})
+
+            semantic_match_query: dict[str, Any] = {}
+            if semantic_candidates and plan.intent in {
+                IntentCategory.trend_drift,
+                IntentCategory.anomaly_check,
+                IntentCategory.hypothesis,
+            }:
+                semantic_childid = self._semantic_childid_match(semantic_candidates)
+                if semantic_childid:
+                    semantic_match_query = semantic_childid
+
+            combined_value_match: dict[str, Any] = {}
+            if value_match_query and semantic_match_query:
+                combined_value_match = {"$and": [value_match_query, semantic_match_query]}
+            elif value_match_query:
+                combined_value_match = value_match_query
+            elif semantic_match_query:
+                combined_value_match = semantic_match_query
+
+            if combined_value_match:
+                pipeline.append({"$match": combined_value_match})
 
             if tests_scope_filters:
-                # When pre_test_ids are available, use an efficient $in filter instead of $lookup
-                if pre_test_ids is not None:
-                    if pre_test_ids:
-                        pipeline.insert(0, {"$match": {"metadata.refId": {"$in": pre_test_ids}}})
-                    else:
-                        # No matching tests found — short-circuit with zero-result pipeline
-                        return MongoQueryCandidate(
-                            collection=collection,
-                            pipeline=[{"$match": {"_id": {"$exists": False}}}],
-                            explanation="No tests matched the entity filters; returning empty result.",
-                            expected_shape=[],
-                        )
-                else:
-                    pipeline.extend(
-                        [
-                            {
-                                "$lookup": {
-                                    "from": self.settings.mongo_collection_tests,
-                                    "localField": "metadata.refId",
-                                    "foreignField": "_id",
-                                    "as": "test",
-                                }
-                            },
-                            {"$unwind": "$test"},
-                        ]
-                    )
+                pipeline.extend(
+                    [
+                        {
+                            "$lookup": {
+                                "from": self.settings.mongo_collection_tests,
+                                "localField": "metadata.refId",
+                                "foreignField": "_id",
+                                "as": "test",
+                            }
+                        },
+                        {"$unwind": "$test"},
+                    ]
+                )
 
-                    tests_match_query = _filters_to_match(
-                        tests_scope_filters,
-                        field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
-                        field_prefix="test.",
-                    )
-                    if tests_match_query:
-                        pipeline.append({"$match": tests_match_query})
+                tests_match_query = _filters_to_match(
+                    tests_scope_filters,
+                    field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
+                    field_prefix="test.",
+                )
+                if tests_match_query:
+                    pipeline.append({"$match": tests_match_query})
         else:
             match_query = _filters_to_match(
                 raw_filters,
@@ -890,11 +1072,37 @@ class MongoExecutor:
                 pipeline.append({"$match": match_query})
 
         if collection == CollectionName.values:
-            if plan.intent in {IntentCategory.trend_drift, IntentCategory.anomaly_check}:
+            if plan.intent == IntentCategory.trend_drift:
                 pipeline.extend(
                     [
                         {"$sort": {"uploadDate": -1}},
-                        {"$limit": min(500, self.settings.max_query_rows)},
+                        {"$limit": min(240, self.settings.max_query_rows)},
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "refId": "$metadata.refId",
+                                "childId": "$metadata.childId",
+                                "uploadDate": 1,
+                                "valuesCount": 1,
+                                # Compute one representative value per document to avoid
+                                # unwinding very large arrays for long-window trend prompts.
+                                "value": {
+                                    "$cond": [
+                                        {"$gt": [{"$size": {"$ifNull": ["$values", []]}}, 0]},
+                                        {"$avg": "$values"},
+                                        None,
+                                    ]
+                                },
+                            }
+                        },
+                        {"$match": {"value": {"$ne": None}}},
+                    ]
+                )
+            elif plan.intent == IntentCategory.anomaly_check:
+                pipeline.extend(
+                    [
+                        {"$sort": {"uploadDate": -1}},
+                        {"$limit": min(320, self.settings.max_query_rows)},
                         {
                             "$project": {
                                 "_id": 0,
@@ -932,24 +1140,61 @@ class MongoExecutor:
                     ]
                 )
         else:
+            question_lower = str(getattr(plan, "user_question", "")).lower()
+            metric_request = self._extract_metric_request(str(getattr(plan, "user_question", "")))
+            is_metric_compare = plan.intent == IntentCategory.comparison and metric_request is not None
+
             if plan.intent == IntentCategory.comparison:
-                pipeline.extend(
-                    [
-                        {
-                            "$project": {
-                                "machine": {
-                                    "$ifNull": [
-                                        "$TestParametersFlat.MACHINE_TYPE_STR",
-                                        "$TestParametersFlat.MACHINE_DATA",
-                                        "Unknown",
-                                    ]
+                if is_metric_compare and metric_request is not None:
+                    pipeline.extend(
+                        [
+                            {
+                                "$project": {
+                                    "tester": "$TestParametersFlat.TESTER",
+                                    "metric_value": {
+                                        "$convert": {
+                                            "input": {
+                                                "$getField": {
+                                                    "input": "$TestParametersFlat",
+                                                    "field": metric_request["attribute_key"],
+                                                }
+                                            },
+                                            "to": "double",
+                                            "onError": None,
+                                            "onNull": None,
+                                        }
+                                    },
                                 }
-                            }
-                        },
-                        {"$group": {"_id": "$machine", "n": {"$sum": 1}}},
-                        {"$sort": {"n": -1}},
-                    ]
-                )
+                            },
+                            {"$match": {"tester": {"$ne": None}, "metric_value": {"$ne": None}}},
+                            {
+                                "$group": {
+                                    "_id": "$tester",
+                                    metric_request["metric_field_name"]: {metric_request["metric_op"]: "$metric_value"},
+                                }
+                            },
+                            {"$project": {"_id": 0, "tester": "$_id", metric_request["metric_field_name"]: 1}},
+                            {"$sort": {"tester": 1}},
+                        ]
+                    )
+                else:
+                    pipeline.extend(
+                        [
+                            {
+                                "$project": {
+                                    "machine": {
+                                        "$ifNull": [
+                                            "$TestParametersFlat.MACHINE_TYPE_STR",
+                                            "$TestParametersFlat.MACHINE_DATA",
+                                            "Unknown",
+                                        ]
+                                    }
+                                }
+                            },
+                            {"$group": {"_id": "$machine", "n": {"$sum": 1}}},
+                            {"$sort": {"n": -1}},
+                        ]
+                    )
             elif plan.intent == IntentCategory.validation_compliance:
                 pipeline.extend(
                     [
@@ -1005,8 +1250,11 @@ class MongoExecutor:
         plan: Any,
         collection_name: str,
     ) -> list[dict[str, Any]] | None:
-        if self.settings.llm_provider.lower() != "anthropic" or not self.gateway.is_ready():
+        provider = self.settings.llm_provider.lower()
+        if provider not in {"anthropic", "openai"} or not self.gateway.is_ready():
             return None
+
+        model_name = self.settings.openai_model_query if provider == "openai" else self.settings.anthropic_model_query
 
         system_prompt = (
             "You repair MongoDB aggregation pipelines. Return strict JSON only with this schema: "
@@ -1019,6 +1267,10 @@ class MongoExecutor:
             "- Keep a reasonable row limit at the end.\n"
             "- Never use $out or $merge.\n"
             "- Do not include markdown.\n"
+            "Schema reminder for _tests collection: ALL metadata is inside TestParametersFlat.\n"
+            "  Use TestParametersFlat.TESTER, TestParametersFlat.CUSTOMER, TestParametersFlat.MATERIAL,\n"
+            "  TestParametersFlat.STANDARD, TestParametersFlat.TYPE_OF_TESTING_STR, TestParametersFlat.MACHINE_TYPE_STR.\n"
+            "  NEVER use bare field names like 'tester' or 'customer' without the TestParametersFlat. prefix.\n"
             f"Collection: {collection_name}\n"
             f"Plan: {plan.model_dump()}\n"
             f"Failed pipeline: {failed_pipeline}\n"
@@ -1027,7 +1279,7 @@ class MongoExecutor:
         )
 
         result = self.gateway.generate_json(
-            model=self.settings.anthropic_model_query,
+            model=model_name,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
@@ -1075,27 +1327,19 @@ class MongoExecutor:
     def run_plan_with_repair(self, plan: Any, max_repairs: int | None = None, semantic_candidates: list[dict] | None = None) -> QueryRunResponse:
         repairs = self.settings.max_query_repairs if max_repairs is None else max_repairs
 
+        candidate = self.generate_candidate_from_plan(plan, allow_llm=True, semantic_candidates=semantic_candidates)
         attempts: list[QueryAttempt] = []
         corrected = False
         fallback_attempted = False
+        current_pipeline = candidate.pipeline
+        pre_resolved_ref_ids: list[str] | None = None
 
         with MongoClient(self.settings.mongo_uri, serverSelectionTimeoutMS=7000) as client:
             db = self._get_database(client)
-
-            # Pre-query the Tests collection to resolve entity filters into refIds.
-            # This lets both the LLM and deterministic paths use an efficient $in filter
-            # instead of a full-collection $lookup on 5.9M value documents.
-            pre_test_ids = self._resolve_tests_scope_to_refids(plan, db)
-
-            candidate = self.generate_candidate_from_plan(
-                plan, allow_llm=True, semantic_candidates=semantic_candidates, pre_test_ids=pre_test_ids
-            )
-
-            # When pre_test_ids were resolved, inject the refId filter into the LLM pipeline.
-            if pre_test_ids is not None and candidate.collection == CollectionName.values:
-                candidate.pipeline = self._inject_refid_filter(candidate.pipeline, pre_test_ids)
-
-            current_pipeline = candidate.pipeline
+            pre_resolved_ref_ids = self._resolve_tests_scope_ref_ids(plan, db)
+            if candidate.collection == CollectionName.values:
+                candidate.pipeline = self._inject_refid_fast_match(candidate.pipeline, pre_resolved_ref_ids)
+                current_pipeline = candidate.pipeline
 
             physical_collection_name = self._physical_collection_name(candidate.collection)
             collection = db[physical_collection_name]
@@ -1117,7 +1361,12 @@ class MongoExecutor:
                     )
 
                     if self.settings.query_mode.lower() == "llm" and len(rows) == 0:
-                        fallback_candidate = self.generate_candidate_from_plan(plan, allow_llm=False, pre_test_ids=pre_test_ids)
+                        fallback_candidate = self.generate_candidate_from_plan(plan, allow_llm=False)
+                        if fallback_candidate.collection == CollectionName.values:
+                            fallback_candidate.pipeline = self._inject_refid_fast_match(
+                                fallback_candidate.pipeline,
+                                pre_resolved_ref_ids,
+                            )
 
                         # Always attempt the deterministic fallback when the LLM pipeline
                         # returned 0 rows. The previous pipeline-equality guard was fragile
@@ -1249,15 +1498,6 @@ class MongoExecutor:
                         physical_collection_name,
                     )
                     corrected = True
-
-        return QueryRunResponse(
-            status="failed",
-            candidate=candidate,
-            attempts=attempts,
-            row_count=0,
-            rows=[],
-            corrected_automatically=(corrected or fallback_attempted),
-        )
 
         return QueryRunResponse(
             status="failed",

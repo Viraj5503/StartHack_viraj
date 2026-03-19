@@ -29,6 +29,13 @@ def health() -> dict[str, str]:
         "insight_mode": settings.insight_mode,
         "llm_provider": settings.llm_provider,
         "anthropic_ready": "yes" if bool(settings.anthropic_api_key) else "no",
+        "openai_ready": "yes" if bool(settings.openai_api_key) else "no",
+        "llm_ready": "yes"
+        if (
+            (settings.llm_provider.lower() == "anthropic" and bool(settings.anthropic_api_key))
+            or (settings.llm_provider.lower() == "openai" and bool(settings.openai_api_key))
+        )
+        else "no",
     }
 
 

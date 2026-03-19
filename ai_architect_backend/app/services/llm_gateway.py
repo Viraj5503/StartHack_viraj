@@ -3,6 +3,7 @@ import re
 from typing import Any
 
 from anthropic import Anthropic
+from openai import OpenAI
 
 from app.config import get_settings
 
@@ -38,12 +39,21 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-class ClaudeGateway:
+class LLMGateway:
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    def _provider(self) -> str:
+        provider = (self.settings.llm_provider or "anthropic").strip().lower()
+        return provider
+
     def is_ready(self) -> bool:
-        return bool(self.settings.anthropic_api_key)
+        provider = self._provider()
+        if provider == "openai":
+            return bool(self.settings.openai_api_key)
+        if provider == "anthropic":
+            return bool(self.settings.anthropic_api_key)
+        return False
 
     def generate_json(
         self,
@@ -54,6 +64,33 @@ class ClaudeGateway:
         temperature: float = 0.0,
     ) -> dict[str, Any] | None:
         if not self.is_ready():
+            return None
+
+        provider = self._provider()
+        if provider == "openai":
+            try:
+                client = OpenAI(api_key=self.settings.openai_api_key)
+                response = client.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+            except Exception:  # noqa: BLE001
+                return None
+
+            content = response.choices[0].message.content if response.choices else None
+            raw_text = content.strip() if isinstance(content, str) else ""
+            if not raw_text:
+                return None
+
+            return _extract_json_object(raw_text)
+
+        if provider != "anthropic":
             return None
 
         try:
@@ -84,3 +121,7 @@ class ClaudeGateway:
             return None
 
         return _extract_json_object(raw_text)
+
+
+# Backward-compatible alias used across existing modules.
+ClaudeGateway = LLMGateway

@@ -180,9 +180,28 @@ def _extract_named_entity_filters(question: str) -> list[dict[str, Any]]:
     q = question.strip()
     filters: list[dict[str, Any]] = []
 
+    def append_tester_filter(raw_value: str) -> None:
+        value = raw_value.strip().strip(",.;:!?")
+        if not value:
+            return
+        if len(value) < 2 or len(value) > 40:
+            return
+
+        lowered = value.lower()
+        if lowered in {"tester", "by", "performed", "data", "tests", "records"}:
+            return
+
+        if any(
+            item.get("field") == "tester" and str(item.get("value", "")).strip().lower() == lowered
+            for item in filters
+        ):
+            return
+
+        filters.append({"field": "tester", "operator": "contains", "value": value})
+
     # Material: "material X" / "the material X" / "of material X"
     mat_m = re.search(
-        r'\b(?:the\s+)?material\s+([A-Za-z0-9][A-Za-z0-9\s\-\.]{1,40}?)(?=\s+(?:regarding|in\s+my|on\b|for\b|and\b|or\b|is\b|are\b|was\b|will\b|the\b|to\b|at\b)|\s*[,\?\.\!]|$)',
+        r'\b(?:the\s+)?material\s+([A-Za-z0-9][A-Za-z0-9\s\-\.\+]{1,40}?)(?=\s+(?:regarding|in\s+my|on\b|for\b|and\b|or\b|is\b|are\b|was\b|will\b|the\b|to\b|at\b|within\b|with\b|under\b|according\b|compliant\b|against\b|limits?\b|guidelines?\b|range\b)|\s*[,\?\.\!]|$)',
         q, re.IGNORECASE,
     )
     if mat_m:
@@ -191,6 +210,28 @@ def _extract_named_entity_filters(question: str) -> list[dict[str, Any]]:
         stop_words = {"and", "or", "the", "a", "is", "are", "was", "were", "in", "for", "on", "my"}
         if val and 2 <= len(val) <= 40 and first_word not in stop_words:
             filters.append({"field": "material", "operator": "contains", "value": val})
+
+    if not any(f.get("field") == "material" for f in filters):
+        # Material fallback: capture phrases like "tensile strength of Steel within ..."
+        mat_of_m = re.search(
+            r'\bof\s+([A-Za-z0-9][A-Za-z0-9\s\-\.\+]{1,30}?)(?=\s+(?:within\b|with\b|under\b|for\b|and\b|or\b|is\b|are\b|guidelines?\b|limits?\b|range\b|tests?\b)|\s*[,\?\.\!]|$)',
+            q,
+            re.IGNORECASE,
+        )
+        if mat_of_m:
+            val = mat_of_m.group(1).strip()
+            first_word = val.lower().split()[0] if val.split() else ""
+            stop_words = {"and", "or", "the", "a", "is", "are", "was", "were", "in", "for", "on", "my", "internal"}
+            if val and 2 <= len(val) <= 40 and first_word not in stop_words:
+                filters.append({"field": "material", "operator": "contains", "value": val})
+
+    if not any(f.get("field") == "material" for f in filters):
+        # Material fallback: short "for Steel?" ending in compliance/hypothesis prompts.
+        mat_for_m = re.search(r'\bfor\s+([A-Za-z][A-Za-z0-9\+\-\.]{1,30})(?=\s*[,\?\.\!]|$)', q, re.IGNORECASE)
+        if mat_for_m:
+            val = mat_for_m.group(1).strip()
+            if val.lower() not in {"my", "all", "this", "that", "tests", "test"}:
+                filters.append({"field": "material", "operator": "contains", "value": val})
 
     # Customer: "customer X" or "for <ProperName> [Industries/Ltd/GmbH ...]"
     cust_m = re.search(
@@ -212,15 +253,40 @@ def _extract_named_entity_filters(question: str) -> list[dict[str, Any]]:
             if val and 2 <= len(val) <= 50:
                 filters.append({"field": "customer", "operator": "contains", "value": val})
 
-    # Tester: "by tester X" / "tester X" / "performed by X"
+    tester_tokens: list[str] = []
+
+    # Tester: "by tester X" / "tester X"
     tester_m = re.search(
-        r'\b(?:by\s+tester|tester)\s+([A-Za-z0-9][A-Za-z0-9\s\-\.]{1,40}?)(?=\s+(?:and|or|on|in|for|the|a|is)|\s*[,\?\.\!]|$)',
+        r'\b(?:by\s+tester\b|tester\b)\s*[:#-]?\s*([A-Za-z0-9_][A-Za-z0-9_\s\-\.]{1,40}?)(?=\s+(?:and|or|on|in|for|the|a|is|are|with|from|during|over)\b|\s*[,\?\.\!]|$)',
         q, re.IGNORECASE,
     )
     if tester_m:
-        val = tester_m.group(1).strip()
-        if val and 2 <= len(val) <= 40:
-            filters.append({"field": "tester", "operator": "contains", "value": val})
+        tester_tokens.append(tester_m.group(1).strip())
+
+    # Tester token fallback: catch standalone handles like "Tester_119" or "tester-119".
+    for token_match in re.finditer(r'\b(tester[_\-][A-Za-z0-9]+)\b', q, re.IGNORECASE):
+        tester_tokens.append(token_match.group(1).strip())
+
+    # Normalize tester tokens and emit one filter. If multiple testers are present,
+    # use a regex alternation so query execution matches all listed testers.
+    normalized_tester_tokens: list[str] = []
+    seen_tester_tokens: set[str] = set()
+    for token in tester_tokens:
+        t = token.strip().strip(",.;:!?")
+        if not t:
+            continue
+        lower_t = t.lower()
+        if lower_t in {"tester", "by", "performed", "data", "tests", "records"}:
+            continue
+        if lower_t not in seen_tester_tokens:
+            seen_tester_tokens.add(lower_t)
+            normalized_tester_tokens.append(t)
+
+    if len(normalized_tester_tokens) > 1:
+        alternation = "|".join(re.escape(token) for token in normalized_tester_tokens)
+        filters.append({"field": "tester", "operator": "regex", "value": rf"\b(?:{alternation})\b"})
+    elif len(normalized_tester_tokens) == 1:
+        append_tester_filter(normalized_tester_tokens[0])
 
     # Standard: ISO/DIN/EN/ASTM patterns
     std_m = re.search(
@@ -229,8 +295,67 @@ def _extract_named_entity_filters(question: str) -> list[dict[str, Any]]:
     )
     if std_m:
         val = std_m.group(1).strip()
+        # Trim conversational tails that are not part of the actual standard token.
+        val = re.sub(r'\s+for\s+[A-Za-z0-9][A-Za-z0-9\s\-\+\.]{0,40}$', '', val, flags=re.IGNORECASE).strip()
+        val = re.sub(r'\s+(?:within|with|under|according|against)\b.*$', '', val, flags=re.IGNORECASE).strip()
         if val:
             filters.append({"field": "standard", "operator": "contains", "value": val})
+
+    # Site / plant: "site Ulm", "plant Kennesaw", "in my local plant"
+    site_m = re.search(
+        r'\b(?:site|plant)\s+([A-Za-z0-9][A-Za-z0-9\s\-_\.]{1,40}?)(?=\s+(?:and|or|on|in|for|the|a|is|are|with|from|during|over)\b|\s*[,\?\.\!]|$)',
+        q,
+        re.IGNORECASE,
+    )
+    if site_m:
+        val = site_m.group(1).strip()
+        if val and 2 <= len(val) <= 40:
+            filters.append({"field": "site", "operator": "contains", "value": val})
+
+    # Time window: "last 6 months", "past one month", "last month", etc.
+    number_words = {
+        "a": 1,
+        "an": 1,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
+
+    time_m = re.search(
+        r'\b(?:last|past)\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(day|days|week|weeks|month|months)\b',
+        q,
+        re.IGNORECASE,
+    )
+    if time_m:
+        raw_amount = time_m.group(1).lower()
+        amount = int(raw_amount) if raw_amount.isdigit() else number_words.get(raw_amount, 1)
+        unit = time_m.group(2).lower()
+        if "day" in unit:
+            value = f"now-{amount}d"
+        elif "week" in unit:
+            value = f"now-{amount}w"
+        else:
+            value = f"now-{amount}months"
+        filters.append({"field": "uploadDate", "operator": "gte", "value": value})
+    elif re.search(r'\b(?:last|past)\s+month\b', q, re.IGNORECASE):
+        filters.append({"field": "uploadDate", "operator": "gte", "value": "now-1months"})
+    elif re.search(r'\b(?:last|past)\s+week\b', q, re.IGNORECASE):
+        filters.append({"field": "uploadDate", "operator": "gte", "value": "now-1w"})
+    elif re.search(r'\b(?:last|past)\s+day\b', q, re.IGNORECASE):
+        filters.append({"field": "uploadDate", "operator": "gte", "value": "now-1d"})
+    elif re.search(r'\bthis\s+week\b', q, re.IGNORECASE):
+        filters.append({"field": "uploadDate", "operator": "gte", "value": "now-7d"})
+    elif re.search(r'\bthis\s+month\b', q, re.IGNORECASE):
+        filters.append({"field": "uploadDate", "operator": "gte", "value": "now-1months"})
 
     return filters
 
@@ -487,12 +612,15 @@ def _build_plan_llm(
     semantic_candidates: list[dict[str, Any]],
 ) -> InvestigationPlan | None:
     settings = get_settings()
-    if settings.llm_provider.lower() != "anthropic":
+    provider = settings.llm_provider.lower()
+    if provider not in {"anthropic", "openai"}:
         return None
 
     gateway = ClaudeGateway()
     if not gateway.is_ready():
         return None
+
+    model_name = settings.openai_model_planner if provider == "openai" else settings.anthropic_model_planner
 
     system_prompt = (
         "You are a materials testing AI planner. Return strictly one JSON object only. "
@@ -537,7 +665,7 @@ def _build_plan_llm(
     )
 
     result = gateway.generate_json(
-        model=settings.anthropic_model_planner,
+        model=model_name,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
     )
@@ -644,7 +772,8 @@ def _build_plan_llm(
     result["assumptions"] = _normalize_str_list(result.get("assumptions"), fallback_plan.assumptions)
     result["reasoning_steps"] = _normalize_str_list(result.get("reasoning_steps"), fallback_plan.reasoning_steps)
     result["follow_up_focus"] = _normalize_str_list(result.get("follow_up_focus"), fallback_plan.follow_up_focus)
-    result["filters"] = _normalize_filters(result.get("filters"))
+    normalized_filters = _normalize_filters(result.get("filters"))
+    result["filters"] = normalized_filters or [flt.model_dump() for flt in fallback_plan.filters]
 
     chart_needed = result.get("chart_needed")
     if isinstance(chart_needed, bool):
