@@ -4,6 +4,7 @@ from typing import Any
 from app.config import get_settings
 from app.schemas import (
     CollectionName,
+    FilterSpec,
     IntentCategory,
     InvestigationPlan,
     PlanOperation,
@@ -48,6 +49,11 @@ def _infer_intent(question_lower: str) -> IntentCategory:
             r"\bfuture\b",
             r"\bboundary\b.*\bviolat\w*\b",
             r"\bviolat\w*\b.*\bfuture\b",
+            r"\bdegradat\w*\b",      # "degradation", "degrades"
+            r"\bworsening\b",
+            r"\bdeteriora\w*\b",     # "deterioration", "deteriorating"
+            r"\bchanging\s+over\b",
+            r"\bevolution\b",
         ],
     ):
         return IntentCategory.trend_drift
@@ -165,6 +171,70 @@ def _extract_field_hints(question_lower: str) -> list[str]:
     return [field for token, field in mapping.items() if token in question_lower]
 
 
+def _extract_named_entity_filters(question: str) -> list[dict[str, Any]]:
+    """Extract named entity filters (material, customer, tester, standard) from the question.
+
+    Uses regex heuristics so the heuristic planner can produce meaningful filters
+    even without an LLM call.
+    """
+    q = question.strip()
+    filters: list[dict[str, Any]] = []
+
+    # Material: "material X" / "the material X" / "of material X"
+    mat_m = re.search(
+        r'\b(?:the\s+)?material\s+([A-Za-z0-9][A-Za-z0-9\s\-\.]{1,40}?)(?=\s+(?:regarding|in\s+my|on\b|for\b|and\b|or\b|is\b|are\b|was\b|will\b|the\b|to\b|at\b)|\s*[,\?\.\!]|$)',
+        q, re.IGNORECASE,
+    )
+    if mat_m:
+        val = mat_m.group(1).strip()
+        first_word = val.lower().split()[0] if val.split() else ""
+        stop_words = {"and", "or", "the", "a", "is", "are", "was", "were", "in", "for", "on", "my"}
+        if val and 2 <= len(val) <= 40 and first_word not in stop_words:
+            filters.append({"field": "material", "operator": "contains", "value": val})
+
+    # Customer: "customer X" or "for <ProperName> [Industries/Ltd/GmbH ...]"
+    cust_m = re.search(
+        r'\bcustomer\s+([A-Za-z0-9][A-Za-z0-9\s\-\.]{1,40}?)(?=\s+(?:regarding|in|for|on|and|or|is|are|was|the|to|of)|\s*[,\?\.\!]|$)',
+        q, re.IGNORECASE,
+    )
+    if cust_m:
+        val = cust_m.group(1).strip()
+        if val and 2 <= len(val) <= 40:
+            filters.append({"field": "customer", "operator": "contains", "value": val})
+    elif not any(f["field"] == "customer" for f in filters):
+        # Try "for <ProperName>" — only match multi-word proper names that look like companies
+        for_m = re.search(
+            r'\bfor\s+([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)+)(?:\s+(?:for|and|or|their|in|on|at|regarding)|\s*[,\?\.\!]|$)',
+            q,
+        )
+        if for_m:
+            val = for_m.group(1).strip()
+            if val and 2 <= len(val) <= 50:
+                filters.append({"field": "customer", "operator": "contains", "value": val})
+
+    # Tester: "by tester X" / "tester X" / "performed by X"
+    tester_m = re.search(
+        r'\b(?:by\s+tester|tester)\s+([A-Za-z0-9][A-Za-z0-9\s\-\.]{1,40}?)(?=\s+(?:and|or|on|in|for|the|a|is)|\s*[,\?\.\!]|$)',
+        q, re.IGNORECASE,
+    )
+    if tester_m:
+        val = tester_m.group(1).strip()
+        if val and 2 <= len(val) <= 40:
+            filters.append({"field": "tester", "operator": "contains", "value": val})
+
+    # Standard: ISO/DIN/EN/ASTM patterns
+    std_m = re.search(
+        r'\b((?:DIN\s+EN\s+ISO|DIN\s+EN|DIN\s+ISO|DIN|ISO|EN|ASTM|BS|JIS|GB)\s+[A-Z0-9][\w\s\-]{1,20})',
+        q, re.IGNORECASE,
+    )
+    if std_m:
+        val = std_m.group(1).strip()
+        if val:
+            filters.append({"field": "standard", "operator": "contains", "value": val})
+
+    return filters
+
+
 _TERM_SYNONYMS: dict[str, list[str]] = {
     # "tensile strength" in ZwickRoell data is represented by stress/force result types.
     "tensile strength": ["maximum force", "upper yield point", "young s modulus"],
@@ -259,6 +329,15 @@ def _build_plan_heuristic(question: str, context: dict[str, Any] | None = None) 
     if context.get("strict") is True:
         confidence = min(0.95, confidence + 0.05)
 
+    # Extract named entity filters from the question text
+    entity_filter_dicts = _extract_named_entity_filters(question)
+    entity_filters: list[FilterSpec] = []
+    for ef in entity_filter_dicts:
+        try:
+            entity_filters.append(FilterSpec(**ef))
+        except Exception:  # noqa: BLE001
+            pass
+
     plan = InvestigationPlan(
         user_question=question,
         normalized_question=normalized,
@@ -271,7 +350,7 @@ def _build_plan_heuristic(question: str, context: dict[str, Any] | None = None) 
         assumptions=assumptions,
         reasoning_steps=reasoning_steps,
         follow_up_focus=follow_up_focus,
-        filters=[],
+        filters=entity_filters,
         confidence=confidence,
     )
 

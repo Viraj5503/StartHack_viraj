@@ -603,7 +603,71 @@ class MongoExecutor:
             validated.append(normalized_stage)
         return validated
 
-    def _generate_candidate_llm(self, plan: Any, semantic_candidates: list[dict] | None = None) -> MongoQueryCandidate | None:
+    # Fields that are reliable for pre-query entity matching.
+    # Excludes testProgramId / program because the LLM often fabricates non-existent IDs.
+    _PREQUERY_ENTITY_FIELDS = {"customer", "material", "standard", "tester", "status", "state", "result"}
+
+    def _resolve_tests_scope_to_refids(self, plan: Any, db: Any, max_ids: int = 2000) -> list[str] | None:
+        """Pre-query the Tests collection to get IDs matching entity-level filters.
+
+        Uses only reliable entity fields (material, customer, tester, standard) to avoid
+        false zero results from LLM-fabricated testProgramId values.
+
+        Returns a list of test IDs (possibly empty) when entity filters exist,
+        or None if no entity filters are present.
+        """
+        raw_filters = [f.model_dump() for f in getattr(plan, "filters", [])]
+
+        def _is_entity_filter(field: str) -> bool:
+            token = _normalize_filter_scope_token(field)
+            return token in self._PREQUERY_ENTITY_FIELDS
+
+        entity_filters = [
+            item for item in raw_filters
+            if _is_entity_filter(str(item.get("field", "")))
+        ]
+        if not entity_filters:
+            return None  # No entity filters — pre-query not needed
+
+        match_query = _filters_to_match(
+            entity_filters,
+            field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
+        )
+        if not match_query:
+            return None
+
+        try:
+            tests_coll = db[self.settings.mongo_collection_tests]
+            cursor = tests_coll.find(match_query, {"_id": 1}).limit(max_ids)
+            return [str(doc["_id"]) for doc in cursor]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _inject_refid_filter(
+        self,
+        pipeline: list[dict[str, Any]],
+        test_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Prepend a metadata.refId filter to the pipeline for efficient Values-collection queries.
+
+        When test IDs are known up-front, filtering by refId at the start of the pipeline
+        is far more efficient than doing a full-collection $lookup.  Any existing $match on
+        metadata.refId is replaced; other stages (including $lookup) are preserved so they
+        don't break correctness.
+        """
+        if not test_ids:
+            # No matching tests → intentionally return zero rows.
+            return [{"$match": {"_id": {"$exists": False}}}]
+
+        refid_stage = {"$match": {"metadata.refId": {"$in": test_ids}}}
+        # Remove any pre-existing metadata.refId $match so we don't double-filter.
+        filtered = [
+            stage for stage in pipeline
+            if not ("$match" in stage and "metadata.refId" in stage.get("$match", {}))
+        ]
+        return [refid_stage] + filtered
+
+    def _generate_candidate_llm(self, plan: Any, semantic_candidates: list[dict] | None = None, pre_test_ids: list[str] | None = None) -> MongoQueryCandidate | None:
         if self.settings.llm_provider.lower() != "anthropic" or not self.gateway.is_ready():
             return None
 
@@ -627,6 +691,24 @@ class MongoExecutor:
             "chart_needed": bool(getattr(plan, "chart_needed", False)),
         }
 
+        # Build the refId hint section when pre-fetched test IDs are available.
+        refid_hint = ""
+        if pre_test_ids is not None:
+            if pre_test_ids:
+                ids_sample = pre_test_ids[:50]
+                refid_hint = (
+                    f"\nPRE-FETCHED TEST IDs ({len(pre_test_ids)} matching tests, showing first {len(ids_sample)}): "
+                    f"{ids_sample}\n"
+                    "IMPORTANT: Use these test IDs to filter the Values collection efficiently:\n"
+                    "  Start the pipeline with: {\"$match\": {\"metadata.refId\": {\"$in\": [<paste IDs here>]}}}\n"
+                    "  Do NOT use $lookup when pre_test_ids are provided — use the $in filter above.\n"
+                )
+            else:
+                refid_hint = (
+                    "\nPRE-FETCHED TEST IDs: NONE FOUND. The tests-scope filters matched zero tests.\n"
+                    "Return a pipeline that will produce 0 results: [{\"$match\": {\"_id\": {\"$exists\": false}}}]\n"
+                )
+
         system_prompt = (
             "You are a MongoDB aggregation generator for materials testing data. "
             "Return strict JSON only."
@@ -640,6 +722,7 @@ class MongoExecutor:
             "CRITICAL Mongo schema facts (read carefully before generating):\n"
             "- Tests physical collection: _tests\n"
             "  Fields: _id (string, format '{UUID}'), name, state, testProgramId, TestParametersFlat (nested object)\n"
+            "  Key TestParametersFlat sub-fields: CUSTOMER, MATERIAL, TESTER, STANDARD, MACHINE_TYPE_STR, CUSTOMER_NAME, NOTES\n"
             "  WARNING: modifiedOn in _tests is stored as {} (empty object) - NEVER filter or sort by modifiedOn\n"
             "- Values physical collection: valuecolumns_migrated\n"
             "  Fields: _id (ObjectId), metadata.refId (string matching _tests._id), "
@@ -647,17 +730,23 @@ class MongoExecutor:
             "uploadDate (ISODate - use this for ALL date/time filtering), values (float array), valuesCount (int)\n"
             "- Join relation: _tests._id == valuecolumns_migrated.metadata.refId\n"
             "- For date/time filtering: ALWAYS use uploadDate on valuecolumns_migrated, never modifiedOn\n"
+            "- For material/customer/tester filtering with the Values collection:\n"
+            "  If pre_test_ids are given (see below), use {\"$match\": {\"metadata.refId\": {\"$in\": [ids]}}}\n"
+            "  If NOT given, use $lookup: {\"from\": \"_tests\", \"localField\": \"metadata.refId\", \"foreignField\": \"_id\", \"as\": \"test\"}\n"
+            "  then $unwind \"$test\" and $match on test.TestParametersFlat.MATERIAL / .CUSTOMER / .TESTER with $regex case-insensitive\n"
+            "- For string field filters (material, customer, tester, standard) always use $regex with $options 'i' for case-insensitive matching\n"
             "- For childId UUID matching: use $regex, e.g. {\"$regex\": \"UUID_HERE\", \"$options\": \"i\"}\n"
             "  The semantic_candidates in the plan contain UUIDs - wrap them in regex for childId matching\n"
             "- If no specific childId UUID is known, do NOT add a childId filter - return all values\n"
             "- IMPORTANT: the values collection contains 5.9M documents. For trend/anomaly analysis, do NOT\n"
-            "  use a small $limit before $unwind. Fetch at least 200 raw documents (before unwind).\n"
+            "  use a small $limit before the material/date filter. Filter first, then limit.\n"
             "  Each document's 'values' array holds ~44000 floats. Use $limit AFTER $unwind to cap output.\n"
             "- DATA DATE RANGE: uploadDate values in the dataset range from 2026-02-27 to 2026-03-03.\n"
             "  For questions like 'last 6 months', use ISODate('2025-09-01') as the lower bound.\n"
             "  DO NOT emit date values as plain strings - emit them as ISO format that Python can parse.\n"
             "  All data falls within the last 6 months, so a broad date range will return results.\n"
             "Avoid deprecated placeholders: site, test_name, sample_id, test_date, test_id, createdAt.\n"
+            f"{refid_hint}"
             f"Plan: {compact_plan}\n"
             f"Semantic UUID candidates (use these for childId regex matching if relevant): {semantic_uuids}\n"
             f"Max rows limit: {self.settings.max_query_rows}\n"
@@ -728,9 +817,9 @@ class MongoExecutor:
             expected_shape=[str(item) for item in expected_shape],
         )
 
-    def generate_candidate_from_plan(self, plan: Any, allow_llm: bool = True, semantic_candidates: list[dict] | None = None) -> MongoQueryCandidate:
+    def generate_candidate_from_plan(self, plan: Any, allow_llm: bool = True, semantic_candidates: list[dict] | None = None, pre_test_ids: list[str] | None = None) -> MongoQueryCandidate:
         if allow_llm and self.settings.query_mode.lower() == "llm":
-            llm_candidate = self._generate_candidate_llm(plan, semantic_candidates=semantic_candidates)
+            llm_candidate = self._generate_candidate_llm(plan, semantic_candidates=semantic_candidates, pre_test_ids=pre_test_ids)
             if llm_candidate is not None:
                 return llm_candidate
 
@@ -758,27 +847,40 @@ class MongoExecutor:
                 pipeline.append({"$match": value_match_query})
 
             if tests_scope_filters:
-                pipeline.extend(
-                    [
-                        {
-                            "$lookup": {
-                                "from": self.settings.mongo_collection_tests,
-                                "localField": "metadata.refId",
-                                "foreignField": "_id",
-                                "as": "test",
-                            }
-                        },
-                        {"$unwind": "$test"},
-                    ]
-                )
+                # When pre_test_ids are available, use an efficient $in filter instead of $lookup
+                if pre_test_ids is not None:
+                    if pre_test_ids:
+                        pipeline.insert(0, {"$match": {"metadata.refId": {"$in": pre_test_ids}}})
+                    else:
+                        # No matching tests found — short-circuit with zero-result pipeline
+                        return MongoQueryCandidate(
+                            collection=collection,
+                            pipeline=[{"$match": {"_id": {"$exists": False}}}],
+                            explanation="No tests matched the entity filters; returning empty result.",
+                            expected_shape=[],
+                        )
+                else:
+                    pipeline.extend(
+                        [
+                            {
+                                "$lookup": {
+                                    "from": self.settings.mongo_collection_tests,
+                                    "localField": "metadata.refId",
+                                    "foreignField": "_id",
+                                    "as": "test",
+                                }
+                            },
+                            {"$unwind": "$test"},
+                        ]
+                    )
 
-                tests_match_query = _filters_to_match(
-                    tests_scope_filters,
-                    field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
-                    field_prefix="test.",
-                )
-                if tests_match_query:
-                    pipeline.append({"$match": tests_match_query})
+                    tests_match_query = _filters_to_match(
+                        tests_scope_filters,
+                        field_resolver=lambda field: self._resolve_filter_field(field, CollectionName.tests),
+                        field_prefix="test.",
+                    )
+                    if tests_match_query:
+                        pipeline.append({"$match": tests_match_query})
         else:
             match_query = _filters_to_match(
                 raw_filters,
@@ -973,14 +1075,28 @@ class MongoExecutor:
     def run_plan_with_repair(self, plan: Any, max_repairs: int | None = None, semantic_candidates: list[dict] | None = None) -> QueryRunResponse:
         repairs = self.settings.max_query_repairs if max_repairs is None else max_repairs
 
-        candidate = self.generate_candidate_from_plan(plan, allow_llm=True, semantic_candidates=semantic_candidates)
         attempts: list[QueryAttempt] = []
         corrected = False
         fallback_attempted = False
-        current_pipeline = candidate.pipeline
 
         with MongoClient(self.settings.mongo_uri, serverSelectionTimeoutMS=7000) as client:
             db = self._get_database(client)
+
+            # Pre-query the Tests collection to resolve entity filters into refIds.
+            # This lets both the LLM and deterministic paths use an efficient $in filter
+            # instead of a full-collection $lookup on 5.9M value documents.
+            pre_test_ids = self._resolve_tests_scope_to_refids(plan, db)
+
+            candidate = self.generate_candidate_from_plan(
+                plan, allow_llm=True, semantic_candidates=semantic_candidates, pre_test_ids=pre_test_ids
+            )
+
+            # When pre_test_ids were resolved, inject the refId filter into the LLM pipeline.
+            if pre_test_ids is not None and candidate.collection == CollectionName.values:
+                candidate.pipeline = self._inject_refid_filter(candidate.pipeline, pre_test_ids)
+
+            current_pipeline = candidate.pipeline
+
             physical_collection_name = self._physical_collection_name(candidate.collection)
             collection = db[physical_collection_name]
 
@@ -1001,7 +1117,7 @@ class MongoExecutor:
                     )
 
                     if self.settings.query_mode.lower() == "llm" and len(rows) == 0:
-                        fallback_candidate = self.generate_candidate_from_plan(plan, allow_llm=False)
+                        fallback_candidate = self.generate_candidate_from_plan(plan, allow_llm=False, pre_test_ids=pre_test_ids)
 
                         # Always attempt the deterministic fallback when the LLM pipeline
                         # returned 0 rows. The previous pipeline-equality guard was fragile
